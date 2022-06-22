@@ -108,7 +108,7 @@ To create an output for value '''v''' to a receiver's stealth address pair '''(A
 # Encrypt the value '''v' = v ^ HASH8(T<sub>vmask</sub>||t)'''
 # Encrypt the nonce '''n' = n ^ HASH16(T<sub>nmask</sub>||t)'''
 # Generate the signature '''&rho;''' for message '''(v'||n'||K<sub>s</sub>||K<sub>o</sub>||K<sub>e</sub>)''' using the sender's key '''k<sub>s</sub>'''
-# Compute the commitment '''C = v*H + q*G''' where '''q = SWITCH(v, HASH32(T<sub>blind</sub>, t))'''
+# Compute the commitment '''C = v*H + q*G''' where '''q = SWITCH(v, HASH32(T<sub>blind</sub>||t))'''
 # Generate the rangeproof '''&pi;''', proving '''v < v<sub>max</sub>''', while also committing to the message '''(C||v'||n'||K<sub>s</sub>||K<sub>o</sub>||K<sub>e</sub>||&rho;)'''
 
 ====3.2 Input Creation====
@@ -173,9 +173,10 @@ Wallets must keep a map '''B<sub>i</sub>'''->'''i''' of all used spend pubkeys a
 
 To check if an output belongs to a wallet:
 
+# Calculate the view tag '''t[0]''' = '''HASH32(T<sub>tag</sub>||a*K<sub>e</sub>)'''
+# If the view tag '''t[0]''' does not match the view tag of the output, it does not belong to the wallet.
 # Calculate the ECDHE shared secret '''t''' = '''HASH32(T<sub>derive</sub>||a*K<sub>e</sub>)'''
-# If the first byte of '''t''' does not match the view tag '''t[0]''', the output does not belong to the wallet.
-# Calculate the one-time spend pubkey: '''B<sub>i</sub>''' = '''K<sub>o</sub>''' * '''HASH32(T<sub>recv</sub>||t)<super>-1</super>'''
+# Calculate the one-time spend pubkey: '''B<sub>i</sub>''' = '''K<sub>o</sub>''' * '''HASH32(T<sub>recv</sub>||t)<sup>-1</sup>'''
 # Lookup the index '''i''' that generates '''B<sub>i</sub>''' from the wallet's map '''B<sub>i</sub>'''->'''i'''. If not found, the output does not belong to the wallet.
 # Decrypt the value '''v''' = '''v' ^ HASH8(T<sub>vmask</sub>||t)'''
 # Verify that '''v*H + SWITCH(v, q)*G''' ?= '''C<sub>o</sub>''' where '''q = HASH32(T<sub>blind</sub>||t)'''
@@ -236,7 +237,6 @@ While this attack theoretically allows you to spend coins of any age, they have 
 
 Given a valid transaction, we need to ensure the transaction inputs or outputs can not be modified or reused by a third party in any way without invalidating the whole transaction. That is, only the transaction originator (sender) has knowledge of the secrets necessary to modify or replace any of the inputs or outputs.
 
-
 =====8.3.1 Kernel Malleability=====
 
 If Bob were to receive an output from Alice, and spend it to Charlie in a 1-1 transaction, Alice and Charlie could work together to learn the kernel commitment's blinding factor, allowing them to replace the kernel altogether. This could allow them to modify lock height, steal part of the fee, or in the case of a peg-out kernel, change the pegout address of the coins.
@@ -247,7 +247,11 @@ By including a stealth excess in the kernel, and using it also to sign the kerne
 
 =====8.3.2 Replay Attacks=====
 
-'''''TODO'''''
+Replay attacks are not fully prevented with this LIP, but a number of techniques exist for identifying and preventing replays in the future.
+
+A wallet-level solution would be to require output messages that specify an expected block- or time-frame for confirmation. Outputs falling outside of that range shall be treated with extra caution, and can be immediately respent to prevent the possibility of replay.
+
+We also have the option to soft-fork in additional rules in the future that would enforce confirmation within a specific block or time window, and preventing duplicates in that same window. This would completely eliminate all known replay attacks.
 
 ===9 Transaction Aggregation===
 
@@ -295,17 +299,14 @@ To verify, the arbiter must:
 # Verify the encrypted nonce:
 #; '''n' ?= n ^ HASH8(T<sub>nmask</sub>||t)'''
 
-==Test Vectors==
-
-'''''TODO'''''
-
 ==Deployment==
 
 This will be activated alongside [https://github.com/litecoin-project/lips/blob/master/lip-0003.mediawiki LIP-0003].
 
 ==Credits==
 
-Special thanks to Hansie Odendaal, Phyro, John Tromp, and Kurt for their valuable feedback on earlier iterations of this design.
+Special thanks to Hansie Odendaal, Phyro, John Tromp, and Kurt Coolman for their valuable feedback on earlier iterations of this design.
+Thanks also to Michele Orr, Georg Fuchsbauer, and the team at MWC for collaborating while they worked on their own [https://eprint.iacr.org/2022/265.pdf NITX scheme].
 
 ==References==
 
