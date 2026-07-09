@@ -1,0 +1,435 @@
+<pre>
+  LIP: 007
+  Layer: Applications
+  Title: PSBT v2 Mimblewimble Extension-Block (MWEB) Support
+  Author: David Burkett <davidburkett38@gmail.com>
+  Comments-Summary: No comments yet.
+  Comments-URI: https://github.com/litecoin/lips/wiki/Comments:LIP-0007
+  Status: Draft
+  Type: Standards Track
+  Created: 2025-07-25
+  License: BSD-2-Clause
+</pre>
+
+== Introduction ==
+
+=== Abstract ===
+
+This proposal extends the Partially Signed Bitcoin Transaction format
+(PSBT version 2, as defined by BIP-0370) to support Litecoin's
+Mimblewimble Extension-Block (MWEB) transactions.
+It specifies new global, per-input, and per-output key-types, and a new
+'''kernel map''' section, that together let wallets collaboratively
+construct, sign, combine, and extract confidential MWEB transactions
+while preserving the role-based flow of BIP-0174/BIP-0370.
+
+=== Copyright ===
+
+This document is licensed under the 2-clause BSD license.
+
+=== Motivation ===
+
+Litecoin activated MWEB in May 2022 (block 2,249,856), enabling
+confidential transfers inside an extension block anchored to each
+main-chain block.
+Collaborative transaction workflows&mdash;hardware wallets, watch-only
+wallets with delegated signing, coinjoins, multi-party peg-ins&mdash;depend
+on PSBT. Without standard key-types covering MWEB's outputs, kernels,
+offsets, stealth commitments, and range proofs, wallet interoperability
+is impossible.
+The goal is a minimal but sufficient extension so that existing
+BIP-0370 implementations can reuse the PSBT key-value encoding rather
+than introduce a new container format. They nevertheless require explicit
+MWEB-aware handling for map classification, required-field exemptions,
+component ordering and counts, kernel maps, combining, and extraction.
+
+== Specification ==
+
+Unless stated otherwise, all PSBT v2 rules from BIP-0370 apply
+unchanged. The key words "MUST", "MUST NOT", "SHOULD", and "MAY" are to
+be interpreted as described in RFC 2119.
+
+Conventions used below:
+
+* All amounts are 8-byte signed little-endian integers denominated in litoshis.
+* All public keys are 33-byte compressed secp256k1 points; all commitments are 33-byte Pedersen commitments; all signatures are 64-byte Schnorr signatures (no sighash byte is appended).
+* Where "None" appears under <tt><keydata></tt>, the key consists of the <tt><keytype></tt> alone.
+* The columns "Inc.", "Exc.", and "Allow" carry the BIP-0370 meanings "Versions Requiring Inclusion", "Versions Requiring Exclusion", and "Versions Allowing Inclusion". No MWEB key is unconditionally required in every v2 PSBT, so requiredness is expressed in prose; every MWEB key is excluded from v0 and allowed in v2.
+* <tt>H(x)</tt> denotes the 32-byte unkeyed BLAKE3 digest of <tt>x</tt>. <tt>HS(x)</tt> converts <tt>H(x)</tt> to a valid non-zero secp256k1 scalar using the MWEB hash-to-scalar rule: use the digest directly when it is valid; otherwise hash the ASCII string <tt>MWEB hash-to-scalar</tt>, the original digest, and a 4-byte little-endian counter starting at zero, incrementing the counter until the result is valid.
+* <tt>SER(x)</tt> denotes the canonical on-chain MWEB serialization of <tt>x</tt>. Variable-length byte strings and vectors include their compact-size length or element count. <tt>VARINT(x)</tt> denotes the Bitcoin Core MSB base-128 variable-integer encoding in <tt>NONNEGATIVE_SIGNED</tt> mode. Signature and ID preimages use these on-chain encodings, not the fixed-width PSBT <tt><valuedata></tt> encodings in the tables below. The symbol <tt>||</tt> denotes byte concatenation.
+
+=== Structure and Ordering ===
+
+A PSBT carrying MWEB data comprises one global map, followed by
+<tt>inputCount</tt> input maps, <tt>outputCount</tt> output maps, and
+<tt>kernelCount</tt> kernel maps, in that order. Kernel maps are
+encoded exactly like other PSBT maps: a sequence of key-value pairs
+terminated by a <tt>0x00</tt> separator byte.
+
+Within the input section, all MWEB input maps MUST come after all
+canonical (main-chain) input maps; likewise for the output section.
+Parsers MUST reject packets violating this ordering.
+
+An input map is an '''MWEB input''' if and only if it contains
+<tt>PSBT_IN_MWEB_OUTPUT_ID</tt>. An output map is an '''MWEB output'''
+if and only if it contains <tt>PSBT_OUT_MWEB_STEALTH_ADDRESS</tt> or
+<tt>PSBT_OUT_MWEB_COMMIT</tt>.
+
+MWEB inputs are exempt from the BIP-0370 requirement to carry
+<tt>PSBT_IN_PREVIOUS_TXID</tt> and <tt>PSBT_IN_OUTPUT_INDEX</tt>.
+MWEB outputs are exempt from the requirement to carry
+<tt>PSBT_OUT_SCRIPT</tt>; they still require <tt>PSBT_OUT_AMOUNT</tt>.
+
+The standard duplicate-key rule applies to every map, including kernel
+maps: a key-type/key-data pair MUST NOT appear more than once per map.
+Unknown key-types MUST be preserved when re-serializing.
+
+=== New Global-Scope Key-types ===
+
+{| class="wikitable"
+! Name !! <tt><keytype></tt> !! <tt><keydata></tt> !! <tt><valuedata></tt> (Description) !! Inc. !! Exc. !! Allow
+|-
+| MWEB Transaction Offset || <tt>PSBT_GLOBAL_MWEB_TX_OFFSET = 0x90</tt> || None || 32-byte kernel-offset blinding factor ||  || 0 || 2
+|-
+| MWEB Stealth Offset || <tt>PSBT_GLOBAL_MWEB_TX_STEALTH_OFFSET = 0x91</tt> || None || 32-byte stealth-offset blinding factor ||  || 0 || 2
+|-
+| MWEB Kernel Count || <tt>PSBT_GLOBAL_MWEB_KERNEL_COUNT = 0x92</tt> || None || <compact-size> number of kernel maps present ||  || 0 || 2
+|}
+
+<tt>PSBT_GLOBAL_MWEB_KERNEL_COUNT</tt> MUST be present when one or more
+kernel maps follow, and MUST be omitted when there are none. There MUST
+be exactly that many kernel maps.
+
+The two offsets are transaction-wide balancing terms defined by the
+MWEB consensus rules: the kernel offset balances the Pedersen
+commitment equation between inputs, outputs, and kernel excesses; the
+stealth offset balances the aggregated input, output, and stealth
+excess public keys. They are absent while the MWEB components are
+unsigned, are computed and set by the signer that finalizes the MWEB
+components (see ''Roles''), and are required for the PSBT to be
+complete whenever any MWEB component is present.
+
+=== New Per-Input Key-types ===
+
+{| class="wikitable"
+! Name !! <tt><keytype></tt> !! <tt><keydata></tt> !! <tt><valuedata></tt> (Description) !! Inc. !! Exc. !! Allow
+|-
+| MWEB Output ID || <tt>PSBT_IN_MWEB_OUTPUT_ID = 0x90</tt> || None || 32-byte ID of the MWEB output being spent ||  || 0 || 2
+|-
+| Spent Output Commitment || <tt>PSBT_IN_MWEB_COMMIT = 0x91</tt> || None || 33-byte Pedersen commitment of the spent output ||  || 0 || 2
+|-
+| Spent Output PubKey || <tt>PSBT_IN_MWEB_OUTPUT_PUBKEY = 0x92</tt> || None || 33-byte receiver pubkey of the spent output ||  || 0 || 2
+|-
+| Input PubKey || <tt>PSBT_IN_MWEB_INPUT_PUBKEY = 0x93</tt> || None || 33-byte ephemeral input pubkey ||  || 0 || 2
+|-
+| Input Features || <tt>PSBT_IN_MWEB_FEATURES = 0x94</tt> || None || 1-byte feature bit-field (see below) ||  || 0 || 2
+|-
+| Input Signature || <tt>PSBT_IN_MWEB_INPUT_SIG = 0x95</tt> || None || 64-byte Schnorr signature (see below) ||  || 0 || 2
+|-
+| MWEB Address Descriptor || <tt>PSBT_IN_MWEB_ADDR_DESCRIPTOR = 0x96</tt> || None || ASCII single-address <tt>mweb(...)</tt> output descriptor for the stealth subaddress the spent output was sent to ||  || 0 || 2
+|-
+| Explicit Amount || <tt>PSBT_IN_MWEB_AMOUNT = 0x97</tt> || None || 8-byte little-endian amount of the spent output ||  || 0 || 2
+|-
+| Shared Secret || <tt>PSBT_IN_MWEB_SHARED_SECRET = 0x98</tt> || None || 32-byte ECDH shared secret of the spent output ||  || 0 || 2
+|-
+| Key-Exchange PubKey || <tt>PSBT_IN_MWEB_KEY_EXCHANGE_PK = 0x99</tt> || None || 33-byte key-exchange pubkey of the spent output ||  || 0 || 2
+|-
+| Input Extra Data || <tt>PSBT_IN_MWEB_EXTRA_DATA = 0x9C</tt> || None || Arbitrary opaque bytes committed by the input ||  || 0 || 2
+|}
+
+Key-types <tt>0x9A</tt> and <tt>0x9B</tt> in the input space are
+reserved for future use.
+
+<tt>PSBT_IN_MWEB_OUTPUT_ID</tt> is required for every MWEB input; it is
+the field that identifies an input map as MWEB. All other keys are
+optional while the input is unsigned. Once finalized, the input MUST
+additionally carry the commitment, output pubkey, features byte, and
+signature, plus the input pubkey when the stealth-key feature bit is
+set and non-empty extra data when the extra-data feature bit is set.
+
+The '''feature bits''' are those of the MWEB input serialization:
+<tt>0x01</tt> = stealth key (an ephemeral input pubkey is present),
+<tt>0x02</tt> = extra data.
+
+The '''input signature''' is a Schnorr signature over
+<tt>H(SER(features) || SER(output_id) [|| SER(extra_data)])</tt> (extra
+data included only when its feature bit is set). When the stealth-key bit
+is clear, the verification key is the spent output's pubkey <tt>Ko</tt>;
+when it is set, the verification key is the aggregated key
+<tt>Ko·HS(SER(Ki) || SER(Ko)) + Ki</tt> where <tt>Ki</tt> is the input
+pubkey.
+
+The '''address descriptor''' is Updater metadata identifying the
+stealth subaddress that received the spent output; when it carries
+private keys, it enables a signer with no key material of its own to
+derive the spend key (delegated signing). Values MUST be ASCII and
+begin with <tt>mweb(</tt>. For backward compatibility with an earlier
+encoding that stored a 4-byte address index under this key-type,
+parsers MUST silently ignore a value of exactly 4 bytes.
+
+The '''shared secret''' (or the key-exchange pubkey, from which a
+holder of the master scan key can derive it) allows the signer to
+re-derive the spent output's blinding factor and spend key. The
+'''explicit amount''' is required by the signer of the MWEB components
+(to reconstruct the input commitment) and by analyzers (to compute the
+fee); an MWEB input without it cannot be analyzed or signed.
+
+=== New Per-Output Key-types ===
+
+{| class="wikitable"
+! Name !! <tt><keytype></tt> !! <tt><keydata></tt> !! <tt><valuedata></tt> (Description) !! Inc. !! Exc. !! Allow
+|-
+| Stealth Address || <tt>PSBT_OUT_MWEB_STEALTH_ADDRESS = 0x90</tt> || None || 66-byte recipient stealth address: scan pubkey <tt>A</tt> followed by spend pubkey <tt>B</tt> ||  || 0 || 2
+|-
+| Output Commitment || <tt>PSBT_OUT_MWEB_COMMIT = 0x91</tt> || None || 33-byte Pedersen commitment of the output amount ||  || 0 || 2
+|-
+| Output Features || <tt>PSBT_OUT_MWEB_FEATURES = 0x92</tt> || None || 1-byte output-message feature bit-field (see below) ||  || 0 || 2
+|-
+| Sender PubKey || <tt>PSBT_OUT_MWEB_SENDER_PUBKEY = 0x93</tt> || None || 33-byte sender one-time pubkey ||  || 0 || 2
+|-
+| Output PubKey || <tt>PSBT_OUT_MWEB_OUTPUT_PUBKEY = 0x94</tt> || None || 33-byte receiver pubkey of the output ||  || 0 || 2
+|-
+| Standard Fields || <tt>PSBT_OUT_MWEB_STANDARD_FIELDS = 0x95</tt> || None || 58 bytes: 33-byte key-exchange pubkey, 1-byte view tag, 8-byte masked value, 16-byte masked nonce ||  || 0 || 2
+|-
+| Range Proof || <tt>PSBT_OUT_MWEB_RANGEPROOF = 0x96</tt> || None || 675-byte Bulletproof for the output commitment ||  || 0 || 2
+|-
+| Output Signature || <tt>PSBT_OUT_MWEB_SIG = 0x97</tt> || None || 64-byte Schnorr signature by the sender key (see below) ||  || 0 || 2
+|-
+| Output Extra Data || <tt>PSBT_OUT_MWEB_EXTRA_DATA = 0x98</tt> || None || Arbitrary opaque bytes carried in the output message ||  || 0 || 2
+|}
+
+An unsigned MWEB output typically carries only the stealth address and
+the (BIP-0370) amount; the signer fills in the remaining fields. Once
+finalized, the output MUST carry the commitment, features byte, sender
+pubkey, output pubkey, range proof, and signature, plus the standard
+fields when the standard-fields feature bit is set and non-empty extra
+data when the extra-data feature bit is set.
+
+The output-message '''feature bits''' are <tt>0x01</tt> = standard
+fields, <tt>0x02</tt> = extra data.
+
+Let <tt>M = SER(output_message)</tt>, consisting of the features byte,
+followed when selected by the feature bits by the 58-byte standard fields
+and then <tt>SER(extra_data)</tt>. Let <tt>Mh = H(M)</tt> and let
+<tt>Ph = H(range_proof)</tt>, where <tt>range_proof</tt> is the complete
+675-byte proof. The range proof MUST verify for the output commitment with
+<tt>M</tt> as its committed proof message. The '''output signature''' is
+a Schnorr signature under the sender pubkey <tt>Ks</tt> over
+<tt>H(SER(C) || SER(Ks) || SER(Ko) || Mh || Ph)</tt>, where <tt>C</tt>
+is the output commitment and <tt>Ko</tt> is the receiver pubkey. The
+'''output ID''' referenced by MWEB inputs is
+<tt>H(SER(C) || SER(Ks) || SER(Ko) || Mh || Ph || SER(signature))</tt>.
+
+=== Kernel Maps ===
+
+Kernel maps follow the last output map. Key-types in kernel maps are a
+single byte and use their own numbering space starting at zero.
+
+{| class="wikitable"
+! Name !! <tt><keytype></tt> !! <tt><keydata></tt> !! <tt><valuedata></tt> (Description) !! Inc. !! Exc. !! Allow
+|-
+| Excess Commitment || <tt>PSBT_KERN_EXCESS_COMMIT = 0x00</tt> || None || 33-byte kernel excess commitment ||  || 0 || 2
+|-
+| Stealth Excess || <tt>PSBT_KERN_STEALTH_COMMIT = 0x01</tt> || None || 33-byte stealth excess pubkey ||  || 0 || 2
+|-
+| Fee || <tt>PSBT_KERN_FEE = 0x02</tt> || None || 8-byte little-endian fee paid inside the extension block ||  || 0 || 2
+|-
+| Pegin Amount || <tt>PSBT_KERN_PEGIN_AMOUNT = 0x03</tt> || None || 8-byte little-endian amount entering MWEB through this kernel ||  || 0 || 2
+|-
+| Peg-out Output || <tt>PSBT_KERN_PEGOUT = 0x04</tt> || <compact-size> index || 8-byte little-endian amount followed by a compact-size-prefixed scriptPubKey (equivalently, a serialized <tt>CTxOut</tt>) leaving MWEB ||  || 0 || 2
+|-
+| Lock Height || <tt>PSBT_KERN_LOCK_HEIGHT = 0x05</tt> || None || 4-byte signed little-endian absolute block-height lock ||  || 0 || 2
+|-
+| Feature Bits || <tt>PSBT_KERN_FEATURES = 0x06</tt> || None || 1-byte kernel feature bit-field (see below) ||  || 0 || 2
+|-
+| Extra Data || <tt>PSBT_KERN_EXTRA_DATA = 0x07</tt> || None || Arbitrary opaque bytes committed inside the kernel ||  || 0 || 2
+|-
+| Kernel Signature || <tt>PSBT_KERN_SIG = 0x08</tt> || None || 64-byte Schnorr signature (see below) ||  || 0 || 2
+|}
+
+Multiple peg-out records MAY appear, distinguished by their key-data
+index. Indexes MUST be contiguous starting from zero, and each peg-out
+scriptPubKey MUST NOT be empty.
+
+The kernel '''feature bits''' mirror the on-chain kernel
+serialization: <tt>0x01</tt> = fee, <tt>0x02</tt> = peg-in,
+<tt>0x04</tt> = peg-out, <tt>0x08</tt> = height lock, <tt>0x10</tt> =
+stealth excess, <tt>0x20</tt> = extra data. When the features byte is
+present it MUST be consistent with the populated fields (each set bit's
+field present, each present field's bit set).
+
+The '''kernel signature''' is a Schnorr signature over
+<tt>H(SER(features) || SER(excess) [|| VARINT(fee)]
+[|| VARINT(pegin_amount)] [|| SER(pegouts)] [|| VARINT(lock_height)]
+[|| SER(stealth_excess)] [|| SER(extra_data)])</tt>, with each bracketed
+field included exactly when its feature bit is set and in the order shown.
+When the stealth-excess bit is clear, the verification key is the excess
+commitment interpreted as a public key <tt>E</tt>. When it is set, the
+verification key is <tt>E·HS(SER(E) || SER(E')) + E'</tt>, where
+<tt>E'</tt> is the stealth-excess pubkey. A kernel map without a signature
+is not finalized.
+
+The '''kernel ID''' of a finalized kernel is the hash of its complete
+on-chain serialization, whose field order is features, optional fee,
+optional peg-in amount, optional peg-outs, optional lock height, optional
+stealth excess, optional extra data, excess commitment, and signature.
+Thus it is
+<tt>H(SER(features) [|| VARINT(fee)] [|| VARINT(pegin_amount)]
+[|| SER(pegouts)] [|| VARINT(lock_height)] [|| SER(stealth_excess)]
+[|| SER(extra_data)] || SER(excess) || SER(signature))</tt>. Peg-in output
+scripts commit to this ID (see below).
+
+=== Peg-in Outputs ===
+
+A peg-in moves main-chain funds into the MWEB. The main-chain side of a
+peg-in is a canonical output whose scriptPubKey is a version-9 witness
+program over the 32-byte kernel ID of the funding kernel:
+<tt>OP_9 <kernel_id></tt>.
+
+Because the kernel ID is unknown until the kernel is signed, the
+Creator/Constructor sets a '''placeholder''' script committing to the
+all-zero hash. The signer that finalizes the MWEB components MUST
+rewrite each placeholder to commit to the corresponding finalized
+kernel's ID, and its amount MUST equal the kernel's peg-in amount.
+
+Whenever a peg-in output and peg-in kernel occupy the same position, the
+output amount MUST equal that kernel's peg-in amount. Combiners MUST verify
+every association that can be formed from the fields already present. Before
+finalization or extraction, the number of peg-in outputs MUST equal the
+number of peg-in kernels, and every peg-in script MUST carry a non-zero ID
+that commits to the kernel at the same position.
+
+=== Completeness ===
+
+A PSBT containing MWEB components is complete when, in addition to the
+BIP-0370 conditions for canonical inputs:
+
+* at least one kernel map is present;
+* every MWEB input carries its signature, commitment, output pubkey, and features byte (plus feature-implied fields);
+* every MWEB output carries its commitment, features byte, sender pubkey, output pubkey, range proof, and signature (plus feature-implied fields);
+* every kernel carries its excess commitment, features byte, and signature (plus feature-implied fields); and
+* both global offsets are present.
+
+Before extraction, implementations MUST verify all signatures, range
+proofs, the kernel balance equation
+<tt>Sum(inputs) + Sum(pegin amounts) = Sum(outputs) + Sum(pegout amounts) + Sum(fees)</tt>,
+and the peg-in script commitments.
+
+=== Combining ===
+
+BIP-0370 identifies PSBTs by the txid of the unsigned transaction. That
+identifier does not commit to MWEB data, and finalizing a peg-in
+script changes it. Combiners MUST therefore treat two PSBTs containing
+MWEB components as candidates for merging when they are ''structurally
+compatible'': equal transaction versions, equal input, output, and
+kernel counts, matching per-index identity (same previous outpoint,
+same MWEB output ID, and same MWEB-ness for inputs and outputs), and
+equal effective lock times.
+
+When merging MWEB components, a combiner MUST apply
+'''strict merging''': a field present on both sides MUST be equal,
+otherwise the combine fails; a field present on one side is copied.
+This applies to every MWEB key listed in this document, to the global
+offsets, and&mdash;within PSBTs containing MWEB components&mdash;to unknown and
+proprietary keys in every global, input, output, and kernel map as well.
+A failed combine MUST leave the destination PSBT unmodified.
+
+Additional combiner rules:
+
+* When kernel fields are merged, a features byte present on either side MUST be recomputed to match the union of populated fields; a features byte inconsistent with its own map's fields invalidates the combine.
+* A placeholder peg-in script may be replaced by a finalized one (and a finalized one is kept when merged with a placeholder), '''unless''' the side carrying the placeholder also carries canonical signature data (partial signatures, final scripts, or taproot signatures)&mdash;those signatures committed to the placeholder outputs, so the combine MUST fail instead. Two differing finalized scripts MUST fail.
+* After a merge, if any MWEB signature or range proof is present, all <tt>PSBT_GLOBAL_TX_MODIFIABLE</tt> bits MUST be cleared.
+
+== Roles ==
+
+The BIP-0370 roles are extended as follows. A key property of MWEB is
+that its components are signed ''monolithically'': one signer finalizes
+all MWEB inputs, outputs, and kernels at once, because the kernel
+excess and offsets depend on every component's blinding factor.
+
+* '''Creator / Constructor''' add MWEB input maps (output ID, plus any known metadata), MWEB output maps (stealth address and amount), and kernel maps (fee, peg-in amount, peg-outs, lock height). Peg-in outputs are added with placeholder scripts. The kernel count is updated as kernel maps are appended. The global offsets are left absent.
+* '''Updater''' attaches the key material the eventual signer needs: the address descriptor, and the shared secret or key-exchange pubkey, for each MWEB input it can identify.
+* '''Signer''' (of the MWEB components) derives each input's spend key from wallet state or from the supplied descriptor and shared secret, computes all output commitments, range proofs, and signatures, signs each input and kernel, rewrites peg-in placeholder scripts to the finalized kernel IDs, sets both global offsets, and clears the <tt>PSBT_GLOBAL_TX_MODIFIABLE</tt> bits. Because this step may rewrite canonical outputs (the peg-in scripts), '''signatures over the canonical inputs MUST be produced after the MWEB components are finalized'''; sighash precomputation performed earlier is invalid.
+* '''Combiner''' merges per the rules in ''Combining''.
+* '''Finalizer''' behaves per BIP-0370 for canonical inputs; MWEB components carry their final form directly in their maps and need no separate finalization step.
+* '''Extractor''' verifies completeness and full cryptographic validity (script signatures, MWEB input, output, and kernel signatures, range proofs, balance, peg-in commitments), then serializes the main-chain transaction together with its MWEB payload assembled from the input, output, kernel, and offset fields.
+
+== Security and Privacy Considerations ==
+
+An MWEB PSBT is not itself a confidential container. Before signing it
+normally exposes explicit input and output amounts, recipient stealth
+addresses, peg-in and peg-out details, and the association of components
+belonging to a single transaction. Implementations SHOULD exchange MWEB
+PSBTs over authenticated, confidential channels and SHOULD avoid retaining
+or logging them longer than necessary.
+
+<tt>PSBT_IN_MWEB_SHARED_SECRET</tt> is sensitive key material: it allows
+recovery of information hidden in the corresponding output and contributes
+to derivation of its blinding factor and spend key. An address descriptor
+may itself contain private scan or spend keys. A packet containing a shared
+secret or a private descriptor MUST be protected as secret-key material and
+MUST NOT be exposed through logs, crash reports, analytics, or untrusted
+storage. Updaters SHOULD include only the minimum key material required by
+the intended signer, and signers SHOULD remove shared secrets and private
+descriptors before forwarding a packet to parties that no longer need them.
+
+Before producing the monolithic MWEB signatures, a signer MUST independently
+verify all transaction details relevant to its policy, including input and
+output amounts, recipient addresses, fees, peg-in amounts, peg-out amounts
+and scripts, lock heights, and committed extra data. Display labels and
+unknown or proprietary fields are unauthenticated metadata and MUST NOT be
+trusted as substitutes for the fields that are actually signed.
+
+Unknown, proprietary, and extra-data fields may reveal implementation or
+wallet fingerprints and may be used as covert channels. Preservation and
+strict merge rules prevent silent disagreement; they do not make such data
+safe to disclose. Implementations SHOULD omit unnecessary metadata and
+SHOULD offer a way to inspect or remove it before external sharing, provided
+that doing so does not invalidate an existing signature or proof.
+
+Because MWEB signing is monolithic, the MWEB signer learns the complete set
+of MWEB inputs, outputs, kernels, and balancing data in the packet. This LIP
+does not provide privacy between mutually distrustful participants or an
+interactive multi-party signing protocol.
+
+== Backwards Compatibility ==
+
+* All key-types defined here MUST NOT appear in a PSBT v0 packet; their presence invalidates it. Likewise, a PSBT containing MWEB components cannot be represented as v0, and serializers MUST refuse to do so.
+* This extension is not transparently compatible with an unmodified BIP-0370 parser. Although unknown keys inside a recognized map can be preserved under BIP-0174, MWEB input maps omit the canonical previous-outpoint fields, MWEB output maps omit the canonical script field, and kernel maps form an additional section after the output maps. An unmodified parser may therefore reject the packet and cannot be expected to preserve the kernel maps.
+* An implementation that does not support this LIP but recognizes any MWEB key-type defined here MUST reject the packet rather than combine, finalize, convert, or extract it. Extraction by an unaware implementation could omit the extension-block payload or construct a transaction different from the one intended.
+
+== Test Vectors ==
+
+The reference implementation pins golden serialized vectors covering
+every key-type defined here (an exhaustive all-fields packet, and fully
+signed MWEB-to-MWEB, peg-in, peg-out, and mixed canonical+MWEB
+packets) in <tt>src/test/util/psbt_vectors.h</tt>, exercised by the
+<tt>psbt_tests</tt>, <tt>psbt_merge_tests</tt>,
+<tt>psbt_finalize_tests</tt>, and <tt>psbt_analysis_tests</tt> unit
+suites. RPC-level vectors, including the BIP-0174/0370/0371 vectors
+adapted to this extension, live in
+<tt>test/functional/data/rpc_psbt.json</tt>.
+
+== Reference Implementation ==
+
+Litecoin Core:
+
+* <tt>src/psbt.h</tt> &mdash; key-type constants and (de)serialization;
+* <tt>src/psbt_merge.cpp</tt> &mdash; combining rules and peg-in script verification;
+* <tt>src/wallet/mweb_psbt.{h,cpp}</tt> &mdash; MWEB input key resolution and component signing;
+* <tt>src/wallet/psbt_filler.{h,cpp}</tt> &mdash; wallet signing orchestration (MWEB-before-script ordering);
+* <tt>src/node/psbt.cpp</tt> &mdash; analysis (roles, fee, MWEB weight);
+* <tt>test/functional/mweb_psbt.py</tt> &mdash; end-to-end RPC coverage.
+
+== Rationale ==
+
+* '''Byte-values follow the on-chain MWEB serialization''' (feature bits, commitments, signatures) to minimize new parsing code.
+* '''Kernel maps are a separate section''' rather than overloading output maps: kernels are transaction-wide objects (fees, peg-in/peg-out totals, locks), not spendable outputs, and BIP-0370's tree structure extends naturally with one more section.
+* '''Offsets are global''' because they are transaction-wide balancing terms with no per-component owner.
+* '''Structural identity replaces txid identity for combining''' because the unsigned txid neither commits to MWEB data nor survives peg-in script finalization; count-and-position matching with strict field merging provides equivalent safety against mixing unrelated transactions.
+* '''Monolithic MWEB signing''' reflects the aggregate nature of Mimblewimble: kernels commit to the sum of all blinding factors, so per-input signing rounds (as in canonical PSBT) are not possible without an interactive multi-party protocol, which is out of scope.
+
+== Future Work ==
+
+* Standalone binary/base64 test-vector documents for non-Core implementers.
+* Interactive multi-party MWEB signing (aggregating blinding factors across signers) may be specified in a follow-up LIP.
