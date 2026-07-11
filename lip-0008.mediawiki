@@ -1,0 +1,199 @@
+<pre>
+  LIP: 0008
+  Layer: Applications
+  Title: MWEB Descriptors
+  Author: David Burkett <davidburkett38@gmail.com>
+  Comments-Summary: No comments yet.
+  Comments-URI: https://github.com/litecoin-project/lips/wiki/Comments:LIP-0008
+  Status: Draft
+  Type: Informational
+  Created: 2026-07-11
+  License: PD
+</pre>
+
+==Abstract==
+
+This LIP defines the '''MWEB descriptor''' function <code>mweb(...)</code> and its allowed encodings, with strict parsing and canonicalization rules. It extends the output script descriptor language to MWEB wallets.
+
+==Motivation==
+
+MWEB wallets need a compact, deterministic way to represent their capabilities in a descriptor string. Such a representation must unambiguously distinguish:
+
+* '''Ranged''' descriptors (covering all subaddresses).
+* '''Single-subaddress''' descriptors (covering one specific subaddress).
+
+and must support both '''spend-capable''' (secret key) and '''watch-only''' (public key) forms.
+
+==Specification==
+
+===Function signature and allowed forms===
+
+Valid forms are:
+
+* <code>mweb(master_scan,master_spend,*)</code>
+* <code>mweb(master_scan,master_spend,&lt;i&gt;)</code>
+* <code>mweb(master_scan,subaddr_spend)</code>
+
+====Ranged (all subaddresses)====
+
+<pre>
+mweb(master_scan,master_spend,*)
+</pre>
+
+Semantics:
+* Identifies (and optionally spends) '''all''' MWEB outputs for the wallet.
+* <code>master_spend</code> MAY be a secret key (spend-capable) or public key (watch-only).
+
+====Single (known subaddress index)====
+
+<pre>
+mweb(master_scan,master_spend,<i>)
+</pre>
+
+Semantics:
+* Identifies (and optionally spends) MWEB outputs for exactly one subaddress, specified by index <code>&lt;i&gt;</code>.
+* <code>master_spend</code> MAY be a secret key (spend-capable) or public key (watch-only).
+* <code>&lt;i&gt;</code> is a decimal, non-negative integer subaddress index.
+
+====Single (unknown index, subaddress spend key known)====
+
+<pre>
+mweb(master_scan,subaddr_spend)
+</pre>
+
+Semantics:
+* Identifies (and optionally spends) MWEB outputs for exactly one subaddress '''without''' explicitly encoding its index.
+* <code>subaddr_spend</code> MAY be a secret key (spend-capable) or public key (watch-only).
+* This form is used when the '''master spend key''' or the '''subaddress index''' is not known/available, but the '''subaddress spend key''' is.
+
+===Parameter rules===
+
+====Parameter 1: master_scan====
+
+* The first parameter is always the '''master scan key (scalar)'''.
+* '''Never''' a master scan public key.
+* Encoded using a <code>KEY</code> expression (see [[#Key encoding (KEY expressions)|Key encoding]]).
+
+====Parameter 2: spend key (master_spend or subaddr_spend)====
+
+The meaning of the second parameter depends on form:
+
+* In 3-parameter forms:
+** <code>mweb(master_scan,master_spend,*)</code>
+** <code>mweb(master_scan,master_spend,&lt;i&gt;)</code>
+** The second parameter is always '''master spend''' key material (secret or public).
+
+* In the 2-parameter form:
+** <code>mweb(master_scan,subaddr_spend)</code>
+** The second parameter is always '''subaddress spend''' key material (secret or public).
+
+====Parameter 3: selector (* or &lt;i&gt;)====
+
+* In ranged form, the third parameter is the literal <code>*</code>.
+* In indexed single form, the third parameter is the literal <code>&lt;i&gt;</code> where <code>i</code> is a decimal integer:
+** Example: <code>mweb(...,...,17)</code>
+
+===Key encoding (KEY expressions)===
+
+All key-like parameters (<code>master_scan</code>, <code>master_spend</code>, <code>subaddr_spend</code>) are encoded using the standard <code>KEY</code> expressions defined in [https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki BIP 380]. In summary, a <code>KEY</code> expression consists of:
+
+* Optionally, key origin information, consisting of:
+** An open bracket <code>[</code>
+** Exactly 8 hex characters for the fingerprint of the key where the derivation starts (see BIP32 for details)
+** Followed by zero or more <code>/NUM</code> or <code>/NUM'</code> path elements to indicate unhardened or hardened derivation steps between the fingerprint and the key or xpub/xprv root that follows
+** A closing bracket <code>]</code>
+* Followed by the actual key, which is either:
+** A hex encoded public key (66 characters starting with <code>02</code> or <code>03</code> for a compressed pubkey, or 130 characters starting with <code>04</code> for an uncompressed pubkey).
+** A WIF encoded private key, with the same meaning as the corresponding public key.
+** An <code>xpub</code> encoded extended public key or <code>xprv</code> encoded extended private key (as defined in BIP32).
+*** Followed by zero or more <code>/NUM</code> unhardened and <code>/NUM'</code> hardened BIP32 derivation steps.
+*** Optionally followed by a single <code>/*</code> or <code>/*'</code> final step to denote all (direct) unhardened or hardened children.
+*** The usage of hardened derivation steps requires providing the private key.
+
+(Anywhere a <code>'</code> suffix is permitted to denote hardened derivation, the suffix <code>h</code> can be used instead.)
+
+X-only public keys (64 hex characters) are '''not''' permitted inside <code>mweb</code>.
+
+===Derivation relationship===
+
+If <code>master_scan</code>, <code>subaddr_spend</code>, and <code>&lt;i&gt;</code> are known, then <code>master_spend</code> can be derived in the MWEB key derivation design.
+
+This enables import/export canonicalization and the validation strategies below.
+
+===Canonicalization (export) rules===
+
+To prevent multiple encodings of the same underlying wallet material, implementations MUST serialize (export) MWEB descriptors using the following canonical forms:
+
+# '''Ranged wallets'''
+#* Always export:
+#** <code>mweb(master_scan,master_spend,*)</code>
+# '''Single-subaddress wallets'''
+#* If <code>master_spend</code> and the subaddress index <code>&lt;i&gt;</code> are known/available:
+#** Export: <code>mweb(master_scan,master_spend,&lt;i&gt;)</code>
+#* Otherwise (when <code>master_spend</code> or <code>&lt;i&gt;</code> is not known/available, but the subaddress spend key is known):
+#** Export: <code>mweb(master_scan,subaddr_spend)</code>
+
+Notes:
+* An importer MAY accept non-canonical but semantically equivalent representations if they are ever introduced, but exporters MUST follow the rules above.
+* Wallets SHOULD preserve the originally imported form only as metadata; descriptor string output MUST be canonical.
+
+===Validation guidelines===
+
+On import, implementations SHOULD perform the strongest validation possible given the provided fields:
+
+* For <code>mweb(master_scan,master_spend,&lt;i&gt;)</code>:
+** Derive the implied subaddress spend key for <code>&lt;i&gt;</code> and ensure internal consistency if the wallet also stores/learns subaddress material.
+
+* For <code>mweb(master_scan,subaddr_spend)</code>:
+** No index consistency check is possible by definition.
+** The wallet MAY attempt discovery strategies if it later learns <code>master_spend</code> or an index mapping.
+
+* For <code>mweb(master_scan,master_spend,*)</code>:
+** Validate literal <code>*</code>.
+** If the key material implies derivation paths, validate those paths per existing descriptor key parsing rules.
+
+===Grammar summary===
+
+All tokens are ASCII. No whitespace allowed.
+
+<pre>
+mweb_desc :=
+    "mweb(" master_scan "," master_spend ",*)" |
+    "mweb(" master_scan "," master_spend "," index ")" |
+    "mweb(" master_scan "," subaddr_spend ")"
+
+index := DIGIT {DIGIT}
+
+master_scan  := KEY   ; scalar (must be private key)
+master_spend := KEY   ; master spend sk or pk
+subaddr_spend:= KEY   ; subaddress spend sk or pk
+</pre>
+
+Type constraints:
+* <code>master_scan</code> MUST represent a scalar (private key material), not a public key.
+* <code>master_spend</code> and <code>subaddr_spend</code> MAY be public or private key material.
+* In 3-arg forms, the second parameter is '''master''' spend material.
+* In the 2-arg form, the second parameter is '''subaddress''' spend material.
+
+===Behavior summary===
+
+{| class="wikitable"
+! Descriptor Form !! Range? !! Scan? !! Spend? !! Notes
+|-
+| <code>mweb(master_scan_sk,master_spend_sk,*)</code> || Yes || Yes || Yes || Full wallet
+|-
+| <code>mweb(master_scan_sk,master_spend_pk,*)</code> || Yes || Yes || No || Watch-only
+|-
+| <code>mweb(master_scan_sk,master_spend_sk,i)</code> || No || Yes || Yes || Single subaddress
+|-
+| <code>mweb(master_scan_sk,master_spend_pk,i)</code> || No || Yes || No || Single view-only
+|-
+| <code>mweb(master_scan_sk,subaddr_spend_sk)</code> || No || Yes || Yes || Single subaddress
+|-
+| <code>mweb(master_scan_sk,subaddr_spend_pk)</code> || No || Yes || No || Single view-only
+|}
+
+==Copyright==
+
+This document is placed in the public domain.
+
